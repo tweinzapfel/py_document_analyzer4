@@ -42,7 +42,7 @@ with st.sidebar:
     status = "✅ Ready" if (OPENAI_API_KEY and client) else "❌ Not configured"
     st.write(f"OpenAI client: {status}")
     if st.button("🧹 Clear results", use_container_width=True):
-        for _k in ("req_df","inst_df","risk_df"):
+        for _k in ("req_df","inst_df","risk_df","lm_df","clause_df","fedrisk_df"):
             st.session_state.pop(_k, None)
         st.success("Cleared saved results.")
         st.rerun()
@@ -228,6 +228,27 @@ QA_TASK = (
     "Return JSON: { 'answer': string, 'citations': [ { 'doc': string, 'page': number } ] }."
 )
 
+# --- Federal smart checks prompts ---
+LM_TASK = (
+    "From the excerpt, extract items from Section L (Instructions, conditions, notices) and Section M (Evaluation factors).\n"
+    "Return STRICT JSON with array 'lm_items'. Each item must include: \n"
+    "- id (e.g., lm_001)\n- part: 'L' or 'M'\n- topic: one of ['submission_structure','volumes','page_limit','format','font','margins','naming','portal','q_and_a','due_date',\n"
+    "            'evaluation_factors','subfactors','basis_of_award','rating_method','tradeoff','past_performance','key_personnel','small_business']\n"
+    "- value: raw text\n- normalized: object (e.g., {'due_datetime': ISO8601, 'units':'pages','limit':n} when applicable)\n- citation: {doc: string, page: number}"
+)
+
+CLAUSE_TASK = (
+    "Identify any FAR or DFARS clause references in the excerpt (e.g., 'FAR 52.204-21', 'DFARS 252.204-7012').\n"
+    "Return STRICT JSON with array 'clauses'. Each item: id (cl_001), system: 'FAR'|'DFARS'|'OTHER', clause (e.g., '52.204-21' or '252.204-7012'),\n"
+    "title (if present), alt (e.g., 'ALT II' if present), date (if present), requirement_summary (short plain-English), citation {doc,page}."
+)
+
+FED_CHECK_TASK = (
+    "Flag federal-specific compliance signals found in the excerpt. Return STRICT JSON with array 'fed_risks'. Each item: \n"
+    "- id (fed_001)\n- category: one of ['CMMC','NIST_800-171','ITAR','EAR','CUI','Data_Rights','IP_rights','OCI','SB_Setaside','Cybersecurity','Supply_Chain','Section508','Export_Control']\n"
+    "- severity: 'H'|'M'|'L'\n- rationale: short reason referencing any clause/section\n- mitigation: short actionable suggestion\n- clause: clause number if applicable (e.g., '252.204-7012')\n- citation: {doc,page}"
+)
+
 
 def llm_json(task: str, content: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
     if not client:
@@ -268,6 +289,9 @@ def llm_json(task: str, content: str, model: str = "gpt-4o-mini") -> Dict[str, A
 REQ_COLS = ["id","requirement_text","category","priority","shall_must","evidence_needed","citation"]
 INST_COLS = ["id","topic","value","normalized","citation"]
 RISK_COLS = ["id","type","severity","rationale","mitigation","citation"]
+LM_COLS = ["id","part","topic","value","normalized","citation"]
+CLAUSE_COLS = ["id","system","clause","title","alt","date","requirement_summary","citation"]
+FEDRISK_COLS = ["id","category","severity","rationale","mitigation","clause","citation"]
 
 
 def _norm_key(val: Any) -> str:
@@ -301,16 +325,20 @@ def _df_from_rows(rows: List[Dict[str, Any]], expected_cols: List[str], dedupe_s
 # Aggregation across chunks (with progress & chunk cap)
 # -----------------------------
 
-def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int = None, enable_fed: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     req_rows: List[Dict[str, Any]] = []
     inst_rows: List[Dict[str, Any]] = []
     risk_rows: List[Dict[str, Any]] = []
+    lm_rows: List[Dict[str, Any]] = []
+    clause_rows: List[Dict[str, Any]] = []
+    fedrisk_rows: List[Dict[str, Any]] = []
 
     total = len(chunks) if max_chunks is None else min(len(chunks), max_chunks)
     prog = st.progress(0, text="Analyzing chunks…")
 
     for idx, ch in enumerate(chunks[:total], start=1):
         content = f"Document: {ch['doc']} | Page: {ch['page']}\n\n{ch['text']}"
+        # Compliance & Instructions
         try:
             data = llm_json(COMPLIANCE_TASK, content, model=model)
             for r in data.get("requirements", []) if isinstance(data, dict) else []:
@@ -319,19 +347,43 @@ def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int 
                 inst_rows.append(i)
         except Exception as e:
             st.info(f"Compliance extraction skipped for {ch['doc']} p.{ch['page']}: {e}")
+        # Generic Risks
         try:
             risks_obj = llm_json(RISK_TASK, content, model=model)
             for rk in risks_obj.get("risks", []) if isinstance(risks_obj, dict) else []:
                 risk_rows.append(rk)
         except Exception as e:
             st.info(f"Risk extraction skipped for {ch['doc']} p.{ch['page']}: {e}")
+        # Federal smart checks
+        if enable_fed:
+            try:
+                lm_obj = llm_json(LM_TASK, content, model=model)
+                for it in lm_obj.get("lm_items", []) if isinstance(lm_obj, dict) else []:
+                    lm_rows.append(it)
+            except Exception as e:
+                st.info(f"L/M extraction skipped for {ch['doc']} p.{ch['page']}: {e}")
+            try:
+                cl_obj = llm_json(CLAUSE_TASK, content, model=model)
+                for cl in cl_obj.get("clauses", []) if isinstance(cl_obj, dict) else []:
+                    clause_rows.append(cl)
+            except Exception as e:
+                st.info(f"Clause spotting skipped for {ch['doc']} p.{ch['page']}: {e}")
+            try:
+                fr_obj = llm_json(FED_CHECK_TASK, content, model=model)
+                for fr in fr_obj.get("fed_risks", []) if isinstance(fr_obj, dict) else []:
+                    fedrisk_rows.append(fr)
+            except Exception as e:
+                st.info(f"Federal risk flags skipped for {ch['doc']} p.{ch['page']}: {e}")
 
         prog.progress(idx/total, text=f"Analyzing chunks… ({idx}/{total})")
 
     req_df = _df_from_rows(req_rows, REQ_COLS, ["requirement_text","citation"])
     inst_df = _df_from_rows(inst_rows, INST_COLS, ["topic","value","citation"])
     risk_df = _df_from_rows(risk_rows, RISK_COLS, ["rationale","citation"])
-    return req_df, inst_df, risk_df
+    lm_df = _df_from_rows(lm_rows, LM_COLS, ["part","topic","value","citation"]) if enable_fed else pd.DataFrame(columns=LM_COLS)
+    clause_df = _df_from_rows(clause_rows, CLAUSE_COLS, ["system","clause","citation"]) if enable_fed else pd.DataFrame(columns=CLAUSE_COLS)
+    fedrisk_df = _df_from_rows(fedrisk_rows, FEDRISK_COLS, ["category","rationale","citation"]) if enable_fed else pd.DataFrame(columns=FEDRISK_COLS)
+    return req_df, inst_df, risk_df, lm_df, clause_df, fedrisk_df
 
 # -----------------------------
 # UI helpers
@@ -368,6 +420,44 @@ def render_results(req_df: pd.DataFrame, inst_df: pd.DataFrame, risk_df: pd.Data
         key="dl_risks",
     )
 
+
+def render_federal(lm_df: pd.DataFrame, clause_df: pd.DataFrame, fedrisk_df: pd.DataFrame):
+    if lm_df.empty and clause_df.empty and fedrisk_df.empty:
+        st.info("No federal-specific items detected (or federal checks disabled).")
+        return
+
+    st.header("🇺🇸 Federal Smart Checks")
+
+    with st.expander("Section L/M Extract (instructions & evaluation)", expanded=True):
+        st.data_editor(lm_df, use_container_width=True, height=320, key="editor_lm")
+        st.download_button(
+            "Download L_M (CSV)",
+            lm_df.to_csv(index=False).encode("utf-8"),
+            file_name="section_LM.csv",
+            mime="text/csv",
+            key="dl_lm",
+        )
+
+    with st.expander("FAR/DFARS Clauses Detected", expanded=True):
+        st.data_editor(clause_df, use_container_width=True, height=320, key="editor_clauses")
+        st.download_button(
+            "Download Clauses (CSV)",
+            clause_df.to_csv(index=False).encode("utf-8"),
+            file_name="clauses.csv",
+            mime="text/csv",
+            key="dl_clauses",
+        )
+
+    with st.expander("Federal Risk Flags (CMMC, ITAR/EAR, Data Rights, etc.)", expanded=True):
+        st.data_editor(fedrisk_df, use_container_width=True, height=320, key="editor_fedrisk")
+        st.download_button(
+            "Download Federal Risks (CSV)",
+            fedrisk_df.to_csv(index=False).encode("utf-8"),
+            file_name="federal_risks.csv",
+            mime="text/csv",
+            key="dl_fedrisk",
+        )
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -382,13 +472,17 @@ st.session_state["model"] = model
 
 target_chars = st.slider("Chunk target size (chars)", 1500, 8000, 4000, 500)
 overlap = st.slider("Chunk overlap (chars)", 0, 1000, 400, 50)
+
+enable_fed = st.checkbox("Enable 🇺🇸 Federal smart checks (FAR/DFARS + Section L/M + CMMC/ITAR)", value=True)
+st.session_state["enable_fed"] = enable_fed
+
 max_chunks = st.slider("Max chunks to analyze (for speed)", 5, 200, 40, 5)
 
 # Invalidate saved results if files changed
 current_key = _files_key(uploaded) if uploaded else ""
 prev_key = st.session_state.get("last_files_key", None)
 if uploaded and prev_key != current_key:
-    for _k in ("req_df","inst_df","risk_df"):
+    for _k in ("req_df","inst_df","risk_df","lm_df","clause_df","fedrisk_df"):
         st.session_state.pop(_k, None)
     st.session_state["last_files_key"] = current_key
 
@@ -420,8 +514,9 @@ if uploaded:
     # ---- Cost estimation UI ----
     st.subheader("💵 Estimated Tokens & Cost")
     colA, colB, colC = st.columns(3)
+    default_calls = 2 + (3 if enable_fed else 0)  # Compliance+Risk (+ L/M + clauses + fed_risks)
     with colA:
-        calls_per_chunk = st.number_input("Calls per chunk", min_value=1, max_value=4, value=2, help="Compliance + Risk = 2 calls")
+        calls_per_chunk = st.number_input("Calls per chunk", min_value=1, max_value=6, value=int(default_calls), help="Compliance + Risk (+ Federal checks if enabled)")
     with colB:
         overhead_tokens = st.number_input("Overhead tokens per call", min_value=0, max_value=3000, value=600, step=50, help="Prompt/system tokens per call")
     with colC:
@@ -465,6 +560,9 @@ if uploaded:
 if all(k in st.session_state for k in ("req_df","inst_df","risk_df")):
     st.success("Showing saved analysis results.")
     render_results(st.session_state["req_df"], st.session_state["inst_df"], st.session_state["risk_df"])
+    render_federal(st.session_state.get("lm_df", pd.DataFrame(columns=LM_COLS)),
+                   st.session_state.get("clause_df", pd.DataFrame(columns=CLAUSE_COLS)),
+                   st.session_state.get("fedrisk_df", pd.DataFrame(columns=FEDRISK_COLS)))
 
 if st.button("🔎 Analyze Documents", type="primary"):
     if not uploaded:
@@ -488,15 +586,19 @@ if st.button("🔎 Analyze Documents", type="primary"):
         pages = cached["pages"]
         chunks = cached["chunks"]
 
-    req_df, inst_df, risk_df = aggregate_results(chunks, model, max_chunks=max_chunks)
+    req_df, inst_df, risk_df, lm_df, clause_df, fedrisk_df = aggregate_results(chunks, model, max_chunks=max_chunks, enable_fed=enable_fed)
 
     # Save results to session state so they survive reruns (e.g., download_button)
     st.session_state["req_df"] = req_df
     st.session_state["inst_df"] = inst_df
     st.session_state["risk_df"] = risk_df
+    st.session_state["lm_df"] = lm_df
+    st.session_state["clause_df"] = clause_df
+    st.session_state["fedrisk_df"] = fedrisk_df
 
     st.success("Analysis complete.")
     render_results(req_df, inst_df, risk_df)
+    render_federal(lm_df, clause_df, fedrisk_df)
 
 st.markdown("---")
-st.caption("MVP demo with chunk planning, cost estimates, schema guards, progress, model fallback, and persistent results.")
+st.caption("MVP demo with chunk planning, cost estimates, schema guards, progress, model fallback, persistent results, and 🇺🇸 Federal smart checks.")
