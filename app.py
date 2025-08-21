@@ -283,4 +283,17 @@ if st.button("🔎 Analyze Documents", type="primary"):
 
     st.success("Analysis complete.")
 
-    st.subheader("📋
+    st.subheader("📋 Compliance Matrix")
+    st.data_editor(req_df, use_container_width=True, height=360)
+    st.download_button("Download Requirements (CSV)", req_df.to_csv(index=False).encode("utf-8"), file_name="requirements.csv", mime="text/csv")
+
+    st.subheader("🗂️ Submission Instructions")
+    st.data_editor(inst_df, use_container_width=True, height=320)
+    st.download_button("Download Instructions (CSV)", inst_df.to_csv(index=False).encode("utf-8"), file_name="instructions.csv", mime="text/csv")
+
+    st.subheader("⚠️ Risk Register")
+    st.data_editor(risk_df, use_container_width=True, height=320)
+    st.download_button("Download Risks (CSV)", risk_df.to_csv(index=False).encode("utf-8"), file_name="risks.csv", mime="text/csv")
+
+st.markdown("---")
+st.caption("MVP demo with schema guards, progress, and model fallback. Next: add real retrieval + XLSX/DOCX/ICS exports.")
