@@ -15,11 +15,30 @@ import pandas as pd
 # -----------------------------
 st.set_page_config(page_title="RFP Analyzer (MVP)", page_icon="📄", layout="wide")
 
-# Read OpenAI key from Streamlit secrets or env var
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+# Configure OpenAI client similar to working recipe app
+def _get_openai_key():
+    if "api_key" in st.secrets:
+        return st.secrets["api_key"]
+    return os.getenv("OPENAI_API_KEY", "")
+
+OPENAI_API_KEY = _get_openai_key()
+
 if not OPENAI_API_KEY:
-    st.warning("Add your OpenAI API key to .streamlit/secrets.toml as OPENAI_API_KEY or set the environment variable.")
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    st.warning("Add your OpenAI API key to .streamlit/secrets.toml as api_key or set the environment variable.")
+
+try:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+except Exception:
+    client = None
+
+# Sidebar diagnostics
+with st.sidebar:
+    st.header("Diagnostics")
+    if OPENAI_API_KEY:
+        st.success("OpenAI client: ✅ Ready")
+    else:
+        st.error("OpenAI client: ❌ Not configured")
+    st.caption("Check that your API key is set in Streamlit secrets or as an environment variable.")
 
 # -----------------------------
 # Helpers: extraction
