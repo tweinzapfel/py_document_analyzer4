@@ -190,7 +190,7 @@ def llm_json(task: str, content: str, model: str = "gpt-4o-mini") -> Dict[str, A
     raise last_err or RuntimeError("All model attempts failed.")
 
 # -----------------------------
-# DataFrame builders with schema guards
+# DataFrame builders with schema guards (dict-safe dedupe)
 # -----------------------------
 
 REQ_COLS = ["id","requirement_text","category","priority","shall_must","evidence_needed","citation"]
@@ -198,22 +198,39 @@ INST_COLS = ["id","topic","value","normalized","citation"]
 RISK_COLS = ["id","type","severity","rationale","mitigation","citation"]
 
 
+def _norm_key(val: Any) -> str:
+    """Normalize any Python value to a stable, hashable string for dedupe keys."""
+    if isinstance(val, (dict, list, tuple, set)):
+        try:
+            return json.dumps(val, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return str(val)
+    if val is None:
+        return ""
+    return str(val)
+
+
 def _df_from_rows(rows: List[Dict[str, Any]], expected_cols: List[str], dedupe_subset: List[str]) -> pd.DataFrame:
-    df = pd.DataFrame(rows or [])
+    # Python-level dedupe so pandas never has to hash dict/list columns
+    seen = set()
+    uniq: List[Dict[str, Any]] = []
+    for r in (rows or []):
+        key = tuple(_norm_key(r.get(c)) for c in dedupe_subset) if dedupe_subset else (str(r),)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
+
+    df = pd.DataFrame(uniq)
     # Ensure expected columns exist
     for c in expected_cols:
         if c not in df.columns:
             df[c] = None
-    # Safe dedupe: only use subset if all columns exist
-    if all(c in df.columns for c in dedupe_subset) and len(df):
-        df = df.drop_duplicates(subset=dedupe_subset)
-    else:
-        df = df.drop_duplicates()
-    # Reorder columns
+    # Reorder and return
     return df[expected_cols].reset_index(drop=True)
 
 # -----------------------------
-# Aggregation across chunks (with progress & chunk cap)
+# Aggregation across chunks (with progress & chunk cap) (with progress & chunk cap)
 # -----------------------------
 
 def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
