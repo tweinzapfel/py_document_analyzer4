@@ -41,6 +41,11 @@ with st.sidebar:
     st.header("Diagnostics")
     status = "✅ Ready" if (OPENAI_API_KEY and client) else "❌ Not configured"
     st.write(f"OpenAI client: {status}")
+    if st.button("🧹 Clear results", use_container_width=True):
+        for _k in ("req_df","inst_df","risk_df"):
+            st.session_state.pop(_k, None)
+        st.success("Cleared saved results.")
+        st.rerun()
 
 # -----------------------------
 # Helpers: file extraction
@@ -140,12 +145,11 @@ def _files_key(files: List[io.BytesIO]) -> str:
 def build_chunk_plan(pages: List[Dict[str, Any]], chunks: List[Dict[str, Any]]) -> pd.DataFrame:
     """Summarize chunking by document (pages, chars, est tokens, chunk count)."""
     rows = []
-    # aggregate per doc
     docs = sorted({p["doc"] for p in pages})
     for doc in docs:
         doc_pages = [p for p in pages if p["doc"] == doc]
         doc_chars = sum(len(p["text"]) for p in doc_pages)
-        est_tokens = int(doc_chars / 4)  # rough heuristic
+        est_tokens = int(doc_chars / 4)
         chunk_count = sum(1 for c in chunks if c["doc"] == doc)
         rows.append({
             "Document": doc,
@@ -162,20 +166,16 @@ def build_chunk_plan(pages: List[Dict[str, Any]], chunks: List[Dict[str, Any]]) 
 # ---- Cost estimation helpers ----
 
 def _estimate_tokens_for_text(text: str) -> int:
-    # very rough heuristic: ~4 chars per token
     return max(1, int(len(text) / 4))
 
 
 def _model_price_defaults(model: str) -> Tuple[float, float]:
-    """Return (price_per_1k_input, price_per_1k_output).
-    NOTE: These are editable placeholders. Update to match your account's pricing.
-    """
     if model == "gpt-4o-mini":
-        return (0.0003, 0.0006)  # $/1K tokens (example; edit as needed)
+        return (0.0003, 0.0006)
     if model == "gpt-4.1":
-        return (0.0050, 0.0150)  # example; edit as needed
+        return (0.0050, 0.0150)
     if model == "gpt-3.5-turbo":
-        return (0.0005, 0.0015)  # example; edit as needed
+        return (0.0005, 0.0015)
     return (0.0, 0.0)
 
 
@@ -186,20 +186,13 @@ def estimate_costs(chunks: List[Dict[str, Any]],
                    price_in_per_1k: float,
                    price_out_per_1k: float,
                    limit_chunks: int | None = None) -> Dict[str, Any]:
-    """Compute token & dollar estimates for a set of chunks."""
     use_chunks = chunks if (limit_chunks is None) else chunks[:limit_chunks]
     n_chunks = len(use_chunks)
-
-    # Input tokens per call = chunk tokens + overhead
     chunk_tokens_total = sum(_estimate_tokens_for_text(c.get("text", "")) for c in use_chunks)
     input_tokens_total = n_chunks * calls_per_chunk * overhead_tokens_per_call + calls_per_chunk * chunk_tokens_total
-
-    # Output tokens are user-estimated per call
     output_tokens_total = n_chunks * calls_per_chunk * est_output_tokens_per_call
-
     cost_in = (input_tokens_total / 1000.0) * price_in_per_1k if price_in_per_1k else 0.0
     cost_out = (output_tokens_total / 1000.0) * price_out_per_1k if price_out_per_1k else 0.0
-
     return {
         "n_chunks": n_chunks,
         "input_tokens": int(input_tokens_total),
@@ -237,7 +230,6 @@ QA_TASK = (
 
 
 def llm_json(task: str, content: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
-    """Call OpenAI and return strict JSON with model fallback and fenced extraction."""
     if not client:
         raise RuntimeError("OpenAI client is not configured.")
     fallback_models = [model, "gpt-4.1", "gpt-4o-mini", "gpt-3.5-turbo"]
@@ -256,7 +248,6 @@ def llm_json(task: str, content: str, model: str = "gpt-4o-mini") -> Dict[str, A
                 temperature=0.0,
             )
             text = resp.choices[0].message.content.strip()
-            # Try direct JSON
             try:
                 return json.loads(text)
             except Exception:
@@ -280,7 +271,6 @@ RISK_COLS = ["id","type","severity","rationale","mitigation","citation"]
 
 
 def _norm_key(val: Any) -> str:
-    """Normalize any Python value to a stable, hashable string for dedupe keys."""
     if isinstance(val, (dict, list, tuple, set)):
         try:
             return json.dumps(val, sort_keys=True, ensure_ascii=False)
@@ -292,7 +282,6 @@ def _norm_key(val: Any) -> str:
 
 
 def _df_from_rows(rows: List[Dict[str, Any]], expected_cols: List[str], dedupe_subset: List[str]) -> pd.DataFrame:
-    # Python-level dedupe so pandas never has to hash dict/list columns
     seen = set()
     uniq: List[Dict[str, Any]] = []
     for r in (rows or []):
@@ -303,11 +292,9 @@ def _df_from_rows(rows: List[Dict[str, Any]], expected_cols: List[str], dedupe_s
         uniq.append(r)
 
     df = pd.DataFrame(uniq)
-    # Ensure expected columns exist
     for c in expected_cols:
         if c not in df.columns:
             df[c] = None
-    # Reorder and return
     return df[expected_cols].reset_index(drop=True)
 
 # -----------------------------
@@ -324,7 +311,6 @@ def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int 
 
     for idx, ch in enumerate(chunks[:total], start=1):
         content = f"Document: {ch['doc']} | Page: {ch['page']}\n\n{ch['text']}"
-        # Requirements & Instructions
         try:
             data = llm_json(COMPLIANCE_TASK, content, model=model)
             for r in data.get("requirements", []) if isinstance(data, dict) else []:
@@ -333,7 +319,6 @@ def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int 
                 inst_rows.append(i)
         except Exception as e:
             st.info(f"Compliance extraction skipped for {ch['doc']} p.{ch['page']}: {e}")
-        # Risks
         try:
             risks_obj = llm_json(RISK_TASK, content, model=model)
             for rk in risks_obj.get("risks", []) if isinstance(risks_obj, dict) else []:
@@ -347,6 +332,41 @@ def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int 
     inst_df = _df_from_rows(inst_rows, INST_COLS, ["topic","value","citation"])
     risk_df = _df_from_rows(risk_rows, RISK_COLS, ["rationale","citation"])
     return req_df, inst_df, risk_df
+
+# -----------------------------
+# UI helpers
+# -----------------------------
+
+def render_results(req_df: pd.DataFrame, inst_df: pd.DataFrame, risk_df: pd.DataFrame):
+    st.subheader("📋 Compliance Matrix")
+    st.data_editor(req_df, use_container_width=True, height=360, key="editor_requirements")
+    st.download_button(
+        "Download Requirements (CSV)",
+        req_df.to_csv(index=False).encode("utf-8"),
+        file_name="requirements.csv",
+        mime="text/csv",
+        key="dl_requirements",
+    )
+
+    st.subheader("🗂️ Submission Instructions")
+    st.data_editor(inst_df, use_container_width=True, height=320, key="editor_instructions")
+    st.download_button(
+        "Download Instructions (CSV)",
+        inst_df.to_csv(index=False).encode("utf-8"),
+        file_name="instructions.csv",
+        mime="text/csv",
+        key="dl_instructions",
+    )
+
+    st.subheader("⚠️ Risk Register")
+    st.data_editor(risk_df, use_container_width=True, height=320, key="editor_risks")
+    st.download_button(
+        "Download Risks (CSV)",
+        risk_df.to_csv(index=False).encode("utf-8"),
+        file_name="risks.csv",
+        mime="text/csv",
+        key="dl_risks",
+    )
 
 # -----------------------------
 # UI
@@ -363,6 +383,14 @@ st.session_state["model"] = model
 target_chars = st.slider("Chunk target size (chars)", 1500, 8000, 4000, 500)
 overlap = st.slider("Chunk overlap (chars)", 0, 1000, 400, 50)
 max_chunks = st.slider("Max chunks to analyze (for speed)", 5, 200, 40, 5)
+
+# Invalidate saved results if files changed
+current_key = _files_key(uploaded) if uploaded else ""
+prev_key = st.session_state.get("last_files_key", None)
+if uploaded and prev_key != current_key:
+    for _k in ("req_df","inst_df","risk_df"):
+        st.session_state.pop(_k, None)
+    st.session_state["last_files_key"] = current_key
 
 # ----- Chunk plan preview (no API) -----
 if uploaded:
@@ -408,7 +436,6 @@ if uploaded:
             price_out = st.number_input("Output price $/1K tokens", min_value=0.0, value=float(default_out), step=0.0001, format="%.6f")
         st.caption("These are editable placeholders — update them to your account's current pricing for accurate estimates.")
 
-    # Estimates for this run and for all chunks
     est_run = estimate_costs(
         chunks,
         calls_per_chunk=calls_per_chunk,
@@ -434,6 +461,11 @@ if uploaded:
     m3.metric("Est. cost (this run)", f"${est_run['cost_total']:,.2f}")
     m4.metric("Est. cost (all chunks)", f"${est_all['cost_total']:,.2f}")
 
+# --- Persisted results display (survives reruns like download_button) ---
+if all(k in st.session_state for k in ("req_df","inst_df","risk_df")):
+    st.success("Showing saved analysis results.")
+    render_results(st.session_state["req_df"], st.session_state["inst_df"], st.session_state["risk_df"])
+
 if st.button("🔎 Analyze Documents", type="primary"):
     if not uploaded:
         st.warning("Please upload at least one PDF or DOCX file.")
@@ -442,7 +474,6 @@ if st.button("🔎 Analyze Documents", type="primary"):
         st.error("OpenAI client not configured. Add your API key and try again.")
         st.stop()
 
-    # Reuse cached pages/chunks if present for the same settings
     key = _files_key(uploaded)
     cache = st.session_state.setdefault("_plan_cache", {})
     cached = cache.get((key, target_chars, overlap))
@@ -459,19 +490,13 @@ if st.button("🔎 Analyze Documents", type="primary"):
 
     req_df, inst_df, risk_df = aggregate_results(chunks, model, max_chunks=max_chunks)
 
+    # Save results to session state so they survive reruns (e.g., download_button)
+    st.session_state["req_df"] = req_df
+    st.session_state["inst_df"] = inst_df
+    st.session_state["risk_df"] = risk_df
+
     st.success("Analysis complete.")
-
-    st.subheader("📋 Compliance Matrix")
-    st.data_editor(req_df, use_container_width=True, height=360)
-    st.download_button("Download Requirements (CSV)", req_df.to_csv(index=False).encode("utf-8"), file_name="requirements.csv", mime="text/csv")
-
-    st.subheader("🗂️ Submission Instructions")
-    st.data_editor(inst_df, use_container_width=True, height=320)
-    st.download_button("Download Instructions (CSV)", inst_df.to_csv(index=False).encode("utf-8"), file_name="instructions.csv", mime="text/csv")
-
-    st.subheader("⚠️ Risk Register")
-    st.data_editor(risk_df, use_container_width=True, height=320)
-    st.download_button("Download Risks (CSV)", risk_df.to_csv(index=False).encode("utf-8"), file_name="risks.csv", mime="text/csv")
+    render_results(req_df, inst_df, risk_df)
 
 st.markdown("---")
-st.caption("MVP demo with chunk planning, cost estimates, schema guards, progress, and model fallback. Next: add real retrieval + XLSX/DOCX/ICS exports.")
+st.caption("MVP demo with chunk planning, cost estimates, schema guards, progress, model fallback, and persistent results.")
