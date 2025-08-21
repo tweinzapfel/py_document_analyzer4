@@ -37,9 +37,6 @@ try:
 except Exception:
     client = None
 
-if not OPENAI_API_KEY:
-    st.warning("OpenAI API key not found. Add it to .streamlit/secrets.toml as 'api_key' or 'OPENAI_API_KEY', or set the OPENAI_API_KEY env var.")
-
 with st.sidebar:
     st.header("Diagnostics")
     status = "✅ Ready" if (OPENAI_API_KEY and client) else "❌ Not configured"
@@ -102,10 +99,11 @@ def load_files(files: List[io.BytesIO]) -> List[Dict[str, Any]]:
     return all_pages
 
 # -----------------------------
-# Chunking
+# Chunking & planning
 # -----------------------------
 
 def chunk_pages(pages: List[Dict[str, Any]], target_chars: int = 4000, overlap: int = 400) -> List[Dict[str, Any]]:
+    """Split page texts into overlapping chunks while preserving doc/page metadata."""
     chunks: List[Dict[str, Any]] = []
     for p in pages:
         text = p["text"]
@@ -127,6 +125,89 @@ def chunk_pages(pages: List[Dict[str, Any]], target_chars: int = 4000, overlap: 
         if buf:
             chunks.append({**p, "chunk": idx, "text": "\n".join(buf)})
     return chunks
+
+
+def _files_key(files: List[io.BytesIO]) -> str:
+    """Stable key for caching by names + sizes."""
+    parts = []
+    for f in files or []:
+        nm = getattr(f, "name", "unknown")
+        sz = getattr(f, "size", None)
+        parts.append(f"{nm}:{sz}")
+    return "|".join(parts)
+
+
+def build_chunk_plan(pages: List[Dict[str, Any]], chunks: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Summarize chunking by document (pages, chars, est tokens, chunk count)."""
+    rows = []
+    # aggregate per doc
+    docs = sorted({p["doc"] for p in pages})
+    for doc in docs:
+        doc_pages = [p for p in pages if p["doc"] == doc]
+        doc_chars = sum(len(p["text"]) for p in doc_pages)
+        est_tokens = int(doc_chars / 4)  # rough heuristic
+        chunk_count = sum(1 for c in chunks if c["doc"] == doc)
+        rows.append({
+            "Document": doc,
+            "Pages": len(doc_pages),
+            "Characters": doc_chars,
+            "Est. tokens": est_tokens,
+            "Est. chunks": chunk_count,
+            "Avg chars/page": int(doc_chars / max(1, len(doc_pages))),
+            "Avg chars/chunk": int(doc_chars / max(1, chunk_count)) if chunk_count else 0,
+        })
+    df = pd.DataFrame(rows).sort_values(["Est. chunks","Document"], ascending=[False, True]).reset_index(drop=True)
+    return df
+
+# ---- Cost estimation helpers ----
+
+def _estimate_tokens_for_text(text: str) -> int:
+    # very rough heuristic: ~4 chars per token
+    return max(1, int(len(text) / 4))
+
+
+def _model_price_defaults(model: str) -> Tuple[float, float]:
+    """Return (price_per_1k_input, price_per_1k_output).
+    NOTE: These are editable placeholders. Update to match your account's pricing.
+    """
+    if model == "gpt-4o-mini":
+        return (0.0003, 0.0006)  # $/1K tokens (example; edit as needed)
+    if model == "gpt-4.1":
+        return (0.0050, 0.0150)  # example; edit as needed
+    if model == "gpt-3.5-turbo":
+        return (0.0005, 0.0015)  # example; edit as needed
+    return (0.0, 0.0)
+
+
+def estimate_costs(chunks: List[Dict[str, Any]],
+                   calls_per_chunk: int,
+                   overhead_tokens_per_call: int,
+                   est_output_tokens_per_call: int,
+                   price_in_per_1k: float,
+                   price_out_per_1k: float,
+                   limit_chunks: int | None = None) -> Dict[str, Any]:
+    """Compute token & dollar estimates for a set of chunks."""
+    use_chunks = chunks if (limit_chunks is None) else chunks[:limit_chunks]
+    n_chunks = len(use_chunks)
+
+    # Input tokens per call = chunk tokens + overhead
+    chunk_tokens_total = sum(_estimate_tokens_for_text(c.get("text", "")) for c in use_chunks)
+    input_tokens_total = n_chunks * calls_per_chunk * overhead_tokens_per_call + calls_per_chunk * chunk_tokens_total
+
+    # Output tokens are user-estimated per call
+    output_tokens_total = n_chunks * calls_per_chunk * est_output_tokens_per_call
+
+    cost_in = (input_tokens_total / 1000.0) * price_in_per_1k if price_in_per_1k else 0.0
+    cost_out = (output_tokens_total / 1000.0) * price_out_per_1k if price_out_per_1k else 0.0
+
+    return {
+        "n_chunks": n_chunks,
+        "input_tokens": int(input_tokens_total),
+        "output_tokens": int(output_tokens_total),
+        "cost_in": float(cost_in),
+        "cost_out": float(cost_out),
+        "cost_total": float(cost_in + cost_out),
+    }
 
 # -----------------------------
 # LLM Prompts & Calls (full, schema-first)
@@ -230,7 +311,7 @@ def _df_from_rows(rows: List[Dict[str, Any]], expected_cols: List[str], dedupe_s
     return df[expected_cols].reset_index(drop=True)
 
 # -----------------------------
-# Aggregation across chunks (with progress & chunk cap) (with progress & chunk cap)
+# Aggregation across chunks (with progress & chunk cap)
 # -----------------------------
 
 def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -280,7 +361,78 @@ model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo"], index
 st.session_state["model"] = model
 
 target_chars = st.slider("Chunk target size (chars)", 1500, 8000, 4000, 500)
+overlap = st.slider("Chunk overlap (chars)", 0, 1000, 400, 50)
 max_chunks = st.slider("Max chunks to analyze (for speed)", 5, 200, 40, 5)
+
+# ----- Chunk plan preview (no API) -----
+if uploaded:
+    key = _files_key(uploaded)
+    cache = st.session_state.setdefault("_plan_cache", {})
+    cached = cache.get((key, target_chars, overlap))
+
+    with st.spinner("Pre-scanning documents to estimate chunks…"):
+        if cached is None:
+            pages = load_files(uploaded)
+            chunks = chunk_pages(pages, target_chars=target_chars, overlap=overlap)
+            cache[(key, target_chars, overlap)] = {"pages": pages, "chunks": chunks}
+        else:
+            pages = cached["pages"]
+            chunks = cached["chunks"]
+
+    plan_df = build_chunk_plan(pages, chunks)
+    total_chunks = len(chunks)
+
+    st.metric(label="Estimated total chunks (all docs)", value=total_chunks)
+    if max_chunks < total_chunks:
+        st.info(f"This run is limited to the first {max_chunks} of {total_chunks} chunks. Increase 'Max chunks' to analyze all.")
+
+    with st.expander("🧮 Chunk Plan (preview — no API calls)", expanded=True):
+        st.dataframe(plan_df, use_container_width=True, height=260)
+
+    # ---- Cost estimation UI ----
+    st.subheader("💵 Estimated Tokens & Cost")
+    colA, colB, colC = st.columns(3)
+    with colA:
+        calls_per_chunk = st.number_input("Calls per chunk", min_value=1, max_value=4, value=2, help="Compliance + Risk = 2 calls")
+    with colB:
+        overhead_tokens = st.number_input("Overhead tokens per call", min_value=0, max_value=3000, value=600, step=50, help="Prompt/system tokens per call")
+    with colC:
+        est_output_tokens = st.number_input("Est. output tokens per call", min_value=0, max_value=5000, value=400, step=50)
+
+    default_in, default_out = _model_price_defaults(model)
+    with st.expander("Set pricing (per 1K tokens)"):
+        c1, c2 = st.columns(2)
+        with c1:
+            price_in = st.number_input("Input price $/1K tokens", min_value=0.0, value=float(default_in), step=0.0001, format="%.6f")
+        with c2:
+            price_out = st.number_input("Output price $/1K tokens", min_value=0.0, value=float(default_out), step=0.0001, format="%.6f")
+        st.caption("These are editable placeholders — update them to your account's current pricing for accurate estimates.")
+
+    # Estimates for this run and for all chunks
+    est_run = estimate_costs(
+        chunks,
+        calls_per_chunk=calls_per_chunk,
+        overhead_tokens_per_call=overhead_tokens,
+        est_output_tokens_per_call=est_output_tokens,
+        price_in_per_1k=price_in,
+        price_out_per_1k=price_out,
+        limit_chunks=min(total_chunks, max_chunks),
+    )
+    est_all = estimate_costs(
+        chunks,
+        calls_per_chunk=calls_per_chunk,
+        overhead_tokens_per_call=overhead_tokens,
+        est_output_tokens_per_call=est_output_tokens,
+        price_in_per_1k=price_in,
+        price_out_per_1k=price_out,
+        limit_chunks=None,
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Input tokens (this run)", f"{est_run['input_tokens']:,}")
+    m2.metric("Output tokens (this run)", f"{est_run['output_tokens']:,}")
+    m3.metric("Est. cost (this run)", f"${est_run['cost_total']:,.2f}")
+    m4.metric("Est. cost (all chunks)", f"${est_all['cost_total']:,.2f}")
 
 if st.button("🔎 Analyze Documents", type="primary"):
     if not uploaded:
@@ -290,11 +442,20 @@ if st.button("🔎 Analyze Documents", type="primary"):
         st.error("OpenAI client not configured. Add your API key and try again.")
         st.stop()
 
-    with st.status("Reading and chunking documents…", expanded=False):
-        pages = load_files(uploaded)
-        st.write(f"Loaded {len(pages)} pages across {len(uploaded)} file(s).")
-        chunks = chunk_pages(pages, target_chars=target_chars)
-        st.write(f"Created {len(chunks)} chunk(s) for analysis.")
+    # Reuse cached pages/chunks if present for the same settings
+    key = _files_key(uploaded)
+    cache = st.session_state.setdefault("_plan_cache", {})
+    cached = cache.get((key, target_chars, overlap))
+    if cached is None:
+        with st.status("Reading and chunking documents…", expanded=False):
+            pages = load_files(uploaded)
+            st.write(f"Loaded {len(pages)} pages across {len(uploaded)} file(s).")
+            chunks = chunk_pages(pages, target_chars=target_chars, overlap=overlap)
+            st.write(f"Created {len(chunks)} chunk(s) for analysis.")
+            cache[(key, target_chars, overlap)] = {"pages": pages, "chunks": chunks}
+    else:
+        pages = cached["pages"]
+        chunks = cached["chunks"]
 
     req_df, inst_df, risk_df = aggregate_results(chunks, model, max_chunks=max_chunks)
 
@@ -313,4 +474,4 @@ if st.button("🔎 Analyze Documents", type="primary"):
     st.download_button("Download Risks (CSV)", risk_df.to_csv(index=False).encode("utf-8"), file_name="risks.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("MVP demo with schema guards, progress, and model fallback. Next: add real retrieval + XLSX/DOCX/ICS exports.")
+st.caption("MVP demo with chunk planning, cost estimates, schema guards, progress, and model fallback. Next: add real retrieval + XLSX/DOCX/ICS exports.")
