@@ -14,7 +14,10 @@ import pandas as pd
 # -----------------------------
 st.set_page_config(page_title="RFP Analyzer (MVP)", page_icon="📄", layout="wide")
 
-# Configure OpenAI client with flexible secrets/env lookup + sidebar diagnostics
+# =============================
+# OpenAI client + diagnostics
+# =============================
+
 def _get_openai_key() -> str:
     candidates = [
         st.secrets.get("api_key"),
@@ -37,16 +40,13 @@ except Exception:
 if not OPENAI_API_KEY:
     st.warning("OpenAI API key not found. Add it to .streamlit/secrets.toml as 'api_key' or 'OPENAI_API_KEY', or set the OPENAI_API_KEY env var.")
 
-# -----------------------------
-# Sidebar diagnostics
-# -----------------------------
 with st.sidebar:
     st.header("Diagnostics")
     status = "✅ Ready" if (OPENAI_API_KEY and client) else "❌ Not configured"
     st.write(f"OpenAI client: {status}")
 
 # -----------------------------
-# Helpers: extraction
+# Helpers: file extraction
 # -----------------------------
 
 def extract_pdf_text_and_pages(file: io.BytesIO, doc_name: str) -> List[Dict[str, Any]]:
@@ -68,6 +68,7 @@ def extract_docx_text_and_pages(file: io.BytesIO, doc_name: str) -> List[Dict[st
     for p in d.paragraphs:
         if p.text and p.text.strip():
             text.append(p.text.strip())
+    # chunk into pseudo-pages for citation stability
     pages = []
     buf, count, idx = [], 0, 1
     for para in text:
@@ -128,20 +129,34 @@ def chunk_pages(pages: List[Dict[str, Any]], target_chars: int = 4000, overlap: 
     return chunks
 
 # -----------------------------
-# LLM Prompts & Calls
+# LLM Prompts & Calls (full, schema-first)
 # -----------------------------
 
-COMPLIANCE_TASK = """
-You are a contracts analyst. From the provided RFP excerpt, extract every *mandatory* requirement and submission instruction explicitly stated.
-Return strict JSON with two arrays: "requirements" and "instructions".
-... (shortened for brevity) ...
-"""
+COMPLIANCE_TASK = (
+    "You are a contracts analyst. From the provided RFP excerpt, extract every mandatory requirement and submission "
+    "instruction explicitly stated. Return STRICT JSON with two arrays: 'requirements' and 'instructions'.\n\n"
+    "For each requirement object include: id (e.g., req_001), requirement_text (quote when short), category one of "
+    "['technical','administrative','pricing','security','legal'], priority one of ['P1','P2','P3'], shall_must (true/false), "
+    "evidence_needed (array of short strings), citation {doc: string, page: number}.\n\n"
+    "For each instruction object include: id (e.g., inst_001), topic one of ['due_date','portal','format','naming','page_limit','font','margins','volumes','attachments'], "
+    "value (raw text), normalized (object with fields like due_datetime ISO-8601 or units/limit when applicable), citation {doc, page}.\n\n"
+    "Only output JSON. No commentary."
+)
 
-RISK_TASK = """..."""
-QA_TASK = """..."""
+RISK_TASK = (
+    "Identify notable compliance and business risks in the excerpt. Return STRICT JSON with array 'risks' of items: "
+    "id (risk_###), type one of ['noncompliance','IP_rights','data_rights','security','schedule','pricing'], "
+    "severity 'H'|'M'|'L', rationale, mitigation, citation {doc,page}."
+)
+
+QA_TASK = (
+    "Answer the user question using ONLY the provided RFP content. Cite sources with {doc,page}. If unknown, say you cannot find it. "
+    "Return JSON: { 'answer': string, 'citations': [ { 'doc': string, 'page': number } ] }."
+)
 
 
 def llm_json(task: str, content: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
+    """Call OpenAI and return strict JSON with model fallback and fenced extraction."""
     if not client:
         raise RuntimeError("OpenAI client is not configured.")
     fallback_models = [model, "gpt-4.1", "gpt-4o-mini", "gpt-3.5-turbo"]
@@ -160,6 +175,7 @@ def llm_json(task: str, content: str, model: str = "gpt-4o-mini") -> Dict[str, A
                 temperature=0.0,
             )
             text = resp.choices[0].message.content.strip()
+            # Try direct JSON
             try:
                 return json.loads(text)
             except Exception:
@@ -174,30 +190,64 @@ def llm_json(task: str, content: str, model: str = "gpt-4o-mini") -> Dict[str, A
     raise last_err or RuntimeError("All model attempts failed.")
 
 # -----------------------------
-# Aggregation across chunks
+# DataFrame builders with schema guards
 # -----------------------------
 
-def aggregate_results(chunks: List[Dict[str, Any]], model: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    req_rows, inst_rows, risk_rows = [], [], []
-    for ch in chunks:
+REQ_COLS = ["id","requirement_text","category","priority","shall_must","evidence_needed","citation"]
+INST_COLS = ["id","topic","value","normalized","citation"]
+RISK_COLS = ["id","type","severity","rationale","mitigation","citation"]
+
+
+def _df_from_rows(rows: List[Dict[str, Any]], expected_cols: List[str], dedupe_subset: List[str]) -> pd.DataFrame:
+    df = pd.DataFrame(rows or [])
+    # Ensure expected columns exist
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = None
+    # Safe dedupe: only use subset if all columns exist
+    if all(c in df.columns for c in dedupe_subset) and len(df):
+        df = df.drop_duplicates(subset=dedupe_subset)
+    else:
+        df = df.drop_duplicates()
+    # Reorder columns
+    return df[expected_cols].reset_index(drop=True)
+
+# -----------------------------
+# Aggregation across chunks (with progress & chunk cap)
+# -----------------------------
+
+def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    req_rows: List[Dict[str, Any]] = []
+    inst_rows: List[Dict[str, Any]] = []
+    risk_rows: List[Dict[str, Any]] = []
+
+    total = len(chunks) if max_chunks is None else min(len(chunks), max_chunks)
+    prog = st.progress(0, text="Analyzing chunks…")
+
+    for idx, ch in enumerate(chunks[:total], start=1):
         content = f"Document: {ch['doc']} | Page: {ch['page']}\n\n{ch['text']}"
+        # Requirements & Instructions
         try:
             data = llm_json(COMPLIANCE_TASK, content, model=model)
-            for r in data.get("requirements", []):
+            for r in data.get("requirements", []) if isinstance(data, dict) else []:
                 req_rows.append(r)
-            for i in data.get("instructions", []):
+            for i in data.get("instructions", []) if isinstance(data, dict) else []:
                 inst_rows.append(i)
         except Exception as e:
             st.info(f"Compliance extraction skipped for {ch['doc']} p.{ch['page']}: {e}")
+        # Risks
         try:
-            risks = llm_json(RISK_TASK, content, model=model).get("risks", [])
-            for rk in risks:
+            risks_obj = llm_json(RISK_TASK, content, model=model)
+            for rk in risks_obj.get("risks", []) if isinstance(risks_obj, dict) else []:
                 risk_rows.append(rk)
         except Exception as e:
             st.info(f"Risk extraction skipped for {ch['doc']} p.{ch['page']}: {e}")
-    req_df = pd.DataFrame(req_rows).drop_duplicates(subset=["requirement_text","citation"]).reset_index(drop=True)
-    inst_df = pd.DataFrame(inst_rows).drop_duplicates(subset=["topic","value","citation"]).reset_index(drop=True)
-    risk_df = pd.DataFrame(risk_rows).drop_duplicates(subset=["rationale","citation"]).reset_index(drop=True)
+
+        prog.progress(idx/total, text=f"Analyzing chunks… ({idx}/{total})")
+
+    req_df = _df_from_rows(req_rows, REQ_COLS, ["requirement_text","citation"])
+    inst_df = _df_from_rows(inst_rows, INST_COLS, ["topic","value","citation"])
+    risk_df = _df_from_rows(risk_rows, RISK_COLS, ["rationale","citation"])
     return req_df, inst_df, risk_df
 
 # -----------------------------
@@ -213,6 +263,7 @@ model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4.1", "gpt-3.5-turbo"], index
 st.session_state["model"] = model
 
 target_chars = st.slider("Chunk target size (chars)", 1500, 8000, 4000, 500)
+max_chunks = st.slider("Max chunks to analyze (for speed)", 5, 200, 40, 5)
 
 if st.button("🔎 Analyze Documents", type="primary"):
     if not uploaded:
@@ -221,15 +272,15 @@ if st.button("🔎 Analyze Documents", type="primary"):
     if not client:
         st.error("OpenAI client not configured. Add your API key and try again.")
         st.stop()
-    pages = load_files(uploaded)
-    chunks = chunk_pages(pages, target_chars=target_chars)
-    req_df, inst_df, risk_df = aggregate_results(chunks, model)
-    st.subheader("📋 Compliance Matrix")
-    st.dataframe(req_df)
-    st.subheader("🗂️ Submission Instructions")
-    st.dataframe(inst_df)
-    st.subheader("⚠️ Risk Register")
-    st.dataframe(risk_df)
 
-st.markdown("---")
-st.caption("MVP demo with robust model fallback.")
+    with st.status("Reading and chunking documents…", expanded=False):
+        pages = load_files(uploaded)
+        st.write(f"Loaded {len(pages)} pages across {len(uploaded)} file(s).")
+        chunks = chunk_pages(pages, target_chars=target_chars)
+        st.write(f"Created {len(chunks)} chunk(s) for analysis.")
+
+    req_df, inst_df, risk_df = aggregate_results(chunks, model, max_chunks=max_chunks)
+
+    st.success("Analysis complete.")
+
+    st.subheader("📋
