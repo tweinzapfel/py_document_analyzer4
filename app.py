@@ -429,12 +429,7 @@ CLAUSE_EXPLAINER_TASK = """
 You will receive a JSON object with fields: system (e.g., 'FAR' or 'DFARS'), clause (e.g., '52.204-21'), and title if known.
 Explain the clause in plain English for proposal compliance. Return STRICT JSON with:
 { 'summary': string, 'pitfalls': [string], 'actions': [string], 'artifacts': [string] } — concise and practical.
-""", clause (e.g., '52.204-21'), and title if known.
-"
-    "Explain the clause in plain English for proposal compliance. Return STRICT JSON with: 
-"
-    "{ 'summary': string, 'pitfalls': [string], 'actions': [string], 'artifacts': [string] } — concise and practical."
-)
+"""
 
 
 def _clause_key(system: Any, clause: Any) -> str:
