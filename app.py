@@ -9,6 +9,8 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument
 from openai import OpenAI
 import pandas as pd
+import re
+
 
 # -----------------------------
 # App Config
@@ -439,8 +441,33 @@ def _clause_key(system: Any, clause: Any) -> str:
 
 
 def _acqgov_link(system: Any, clause: Any) -> str:
-    q = f"{str(system or '').strip()} {str(clause or '').strip()}".strip()
-    return f"https://www.acquisition.gov/search?search={quote_plus(q)}"
+    """Return a direct acquisition.gov anchor when possible.
+    Examples:
+      FAR 52.204-16   -> https://www.acquisition.gov/far/part-52#FAR_52_204_16
+      DFARS 252.204-7012 -> https://www.acquisition.gov/dfars/part-252#DFARS_252_204_7012
+    Falls back to site search if parsing fails.
+    """
+    try:
+        sys = str(system or "").strip().upper()
+        cl = str(clause or "").strip()
+        # Parse patterns like 52.204-16 or 252.204-7012
+        m = re.match(r"^(\d{2,3})\.(\d{3})(?:-(\d{1,4}))?$", cl)
+        if m:
+            part, subpart, section = m.group(1), m.group(2), m.group(3)
+            # strip any leading zeros just in case
+            part = str(int(part))
+            subpart = str(int(subpart))
+            section = str(int(section)) if section else None
+
+            root = "far" if sys == "FAR" else ("dfars" if sys == "DFARS" else None)
+            if root:
+                anchor = f"{sys}_{part}_{subpart}" + (f"_{section}" if section else "")
+                return f"https://www.acquisition.gov/{root}/part-{part}#{anchor}"
+
+        # Fallback to search if we can't confidently parse the clause number
+        return f"https://www.acquisition.gov/search?search={quote_plus(sys + ' ' + cl)}"
+    except Exception:
+        return f"https://www.acquisition.gov/search?search={quote_plus(str(system) + ' ' + str(clause))}"
 
 
 def build_clause_explainers(clause_df: pd.DataFrame, use_llm: bool, model: str) -> pd.DataFrame:
