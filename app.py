@@ -2,6 +2,7 @@ import os
 import io
 import json
 from typing import List, Dict, Any, Tuple
+from urllib.parse import quote_plus
 
 import streamlit as st
 from pypdf import PdfReader
@@ -42,7 +43,7 @@ with st.sidebar:
     status = "✅ Ready" if (OPENAI_API_KEY and client) else "❌ Not configured"
     st.write(f"OpenAI client: {status}")
     if st.button("🧹 Clear results", use_container_width=True):
-        for _k in ("req_df","inst_df","risk_df","lm_df","clause_df","fedrisk_df"):
+        for _k in ("req_df","inst_df","risk_df","lm_df","clause_df","fedrisk_df","clause_exp_df"):
             st.session_state.pop(_k, None)
         st.success("Cleared saved results.")
         st.rerun()
@@ -322,7 +323,169 @@ def _df_from_rows(rows: List[Dict[str, Any]], expected_cols: List[str], dedupe_s
     return df[expected_cols].reset_index(drop=True)
 
 # -----------------------------
+# Clause library & explainers
+# -----------------------------
+
+CLAUSE_LIBRARY: Dict[str, Dict[str, Any]] = {
+    # Cyber & safeguarding
+    "FAR 52.204-21": {
+        "summary": "Basic safeguarding for contractor info systems that process or store Federal contract information (FCI). 15 baseline controls.",
+        "pitfalls": [
+            "Assuming it only applies to CUI — it applies to FCI, too.",
+            "No written proof of controls (policies, training records).",
+        ],
+        "actions": [
+            "Confirm 15 safeguards (e.g., access control, patching, malware protection).",
+            "Document in SSP; train staff; flow down to subs handling FCI.",
+        ],
+        "artifacts": ["SSP or policy set", "Training logs"],
+    },
+    "DFARS 252.204-7012": {
+        "summary": "Safeguard Covered Defense Information; implement NIST SP 800-171; 72-hr cyber incident reporting; cloud providers must meet FedRAMP Moderate equivalent.",
+        "pitfalls": [
+            "No SPRS/NIST alignment; unclear incident reporting flow.",
+            "For cloud use, lacking Gov/FedRAMP-Moderate-equivalent attestation.",
+        ],
+        "actions": [
+            "Implement 800-171; maintain SSP/POA&M; flowdown; 72-hr DoD reporting.",
+            "Ensure cloud terms meet -7012 paragraph (b)(2)(ii)(D).",
+        ],
+        "artifacts": ["SSP", "POA&M", "IR plan", "Sub flowdown"],
+    },
+    "DFARS 252.204-7019": {
+        "summary": "DoD Assessment Requirements; contractor must have a current NIST 800-171 assessment score in SPRS.",
+        "pitfalls": ["Bid submitted without posting Basic/Medium/High score in SPRS."],
+        "actions": ["Post current score to SPRS; keep evidence for spot checks."],
+        "artifacts": ["SPRS screenshot", "Assessment worksheet"],
+    },
+    "DFARS 252.204-7020": {
+        "summary": "NIST assessment methodology; permits DoD to perform (and contractor to support) assessments; requires flowdown.",
+        "pitfalls": ["Subcontractors not informed; missing flowdown."],
+        "actions": ["Flow down to subs; prepare for DoD assessment requests."],
+        "artifacts": ["Flowdown clause", "Assessment prep notes"],
+    },
+    "DFARS 252.204-7021": {
+        "summary": "CMMC requirement clause specifying the level required and timing; ties to certification obligations.",
+        "pitfalls": ["Wrong level assumed; not aligning scope and asset boundary."],
+        "actions": ["Confirm required level; plan timeline; coordinate with assessor."],
+        "artifacts": ["CMMC level statement", "Scope diagram"],
+    },
+    # Commercial items
+    "FAR 52.212-1": {
+        "summary": "Instructions to Offerors for commercial products/services; governs submission format, packaging, reps/certs.",
+        "pitfalls": ["Ignoring addenda in the solicitation that change defaults."],
+        "actions": ["Mirror submission structure and reps/certs exactly; follow addenda."],
+        "artifacts": ["Submission checklist"],
+    },
+    "FAR 52.212-2": {
+        "summary": "Evaluation factors for award on commercial items (price, technical, past performance, etc.).",
+        "pitfalls": ["Not mapping proposal to stated factors/subfactors."],
+        "actions": ["Build a factor-by-factor crosswalk; provide discriminators."],
+        "artifacts": ["Evaluation crosswalk"],
+    },
+    # Set-asides
+    "FAR 52.219-6": {
+        "summary": "Notice of Total Small Business Set-Aside; size standard must be met for the NAICS code.",
+        "pitfalls": ["SAM profile NAICS mismatch; subcontracting plan assumptions."],
+        "actions": ["Verify size under NAICS; update SAM; consider teaming if needed."],
+        "artifacts": ["SAM/DSBS screenshots"],
+    },
+    # IP/data rights
+    "FAR 52.227-14": {
+        "summary": "Rights in Data—General; sets Government rights in data first produced under the contract and delivered data.",
+        "pitfalls": ["Failing to mark limited/restricted rights; losing rights by default."],
+        "actions": ["Identify data categories; apply legends; include special license terms as needed."],
+        "artifacts": ["Data rights matrix", "Marking plan"],
+    },
+    # Prohibitions
+    "FAR 52.204-23": {
+        "summary": "Prohibition on Kaspersky Lab products and services.",
+        "pitfalls": ["Asset inventory not checked; suppliers not screened."],
+        "actions": ["Scan inventory/SBOM; attest to non-use; update supply chain checks."],
+        "artifacts": ["Supplier attestation"],
+    },
+    "FAR 52.204-24": {
+        "summary": "Representation regarding use of covered telecommunications (Huawei/ZTE, etc.).",
+        "pitfalls": ["Incomplete due diligence beyond Tier-1 vendors."],
+        "actions": ["Run supply chain questionnaires; document determination; prepare alternate offer if applicable."],
+        "artifacts": ["Representation form", "Supplier survey"],
+    },
+    "FAR 52.204-25": {
+        "summary": "Prohibition on contracting for covered telecommunications equipment or services.",
+        "pitfalls": ["No remediation plan if discovered post-award."],
+        "actions": ["Implement detection/removal procedures; report promptly if found."],
+        "artifacts": ["Removal SOP"],
+    },
+    # Cloud
+    "DFARS 252.239-7010": {
+        "summary": "Cloud Computing Services; requires DoD SRG compliance, incident reporting, forensic records, and data location/portability.",
+        "pitfalls": ["Hosting outside approved impact levels; unclear incident timelines."],
+        "actions": ["Match SRG IL to data sensitivity; include incident & data return terms."],
+        "artifacts": ["Cloud SRG mapping", "IR clause addendum"],
+    },
+}
+
+CLAUSE_EXPLAINER_TASK = (
+    "You will receive a JSON object with fields: system (e.g., 'FAR' or 'DFARS'), clause (e.g., '52.204-21'), and title if known.
+"
+    "Explain the clause in plain English for proposal compliance. Return STRICT JSON with: 
+"
+    "{ 'summary': string, 'pitfalls': [string], 'actions': [string], 'artifacts': [string] } — concise and practical."
+)
+
+
+def _clause_key(system: Any, clause: Any) -> str:
+    sys = (str(system or "").strip().upper())
+    cl = (str(clause or "").strip())
+    return f"{sys} {cl}".strip()
+
+
+def _acqgov_link(system: Any, clause: Any) -> str:
+    q = f"{str(system or '').strip()} {str(clause or '').strip()}".strip()
+    return f"https://www.acquisition.gov/search?search={quote_plus(q)}"
+
+
+def build_clause_explainers(clause_df: pd.DataFrame, use_llm: bool, model: str) -> pd.DataFrame:
+    if clause_df is None or clause_df.empty:
+        return pd.DataFrame(columns=list(CLAUSE_COLS) + ["summary","pitfalls","actions","artifacts","reference_url"])
+
+    rows = []
+    cache: Dict[str, Dict[str, Any]] = {}
+    for _, r in clause_df.iterrows():
+        row = r.to_dict()
+        key = _clause_key(row.get("system"), row.get("clause"))
+        link = _acqgov_link(row.get("system"), row.get("clause"))
+        lib = CLAUSE_LIBRARY.get(key)
+        if lib:
+            expl = lib
+        else:
+            if key not in cache and use_llm and client:
+                try:
+                    payload = {"system": row.get("system"), "clause": row.get("clause"), "title": row.get("title")}
+                    out = llm_json(CLAUSE_EXPLAINER_TASK, json.dumps(payload), model=model)
+                    cache[key] = out if isinstance(out, dict) else {}
+                except Exception:
+                    cache[key] = {}
+            expl = cache.get(key, {})
+        rows.append({
+            **row,
+            "summary": expl.get("summary"),
+            "pitfalls": expl.get("pitfalls"),
+            "actions": expl.get("actions"),
+            "artifacts": expl.get("artifacts"),
+            "reference_url": link,
+        })
+
+    cols = list(CLAUSE_COLS) + ["summary","pitfalls","actions","artifacts","reference_url"]
+    df = pd.DataFrame(rows)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols]
+
+# -----------------------------
 # Aggregation across chunks (with progress & chunk cap)
+# -----------------------------
 # -----------------------------
 
 def aggregate_results(chunks: List[Dict[str, Any]], model: str, max_chunks: int = None, enable_fed: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -429,7 +592,7 @@ def render_federal(lm_df: pd.DataFrame, clause_df: pd.DataFrame, fedrisk_df: pd.
     st.header("🇺🇸 Federal Smart Checks")
 
     with st.expander("Section L/M Extract (instructions & evaluation)", expanded=True):
-        st.data_editor(lm_df, use_container_width=True, height=320, key="editor_lm")
+        st.data_editor(lm_df, use_container_width=True, height=320, key="editor_lm", hide_index=True)
         st.download_button(
             "Download L_M (CSV)",
             lm_df.to_csv(index=False).encode("utf-8"),
@@ -439,7 +602,29 @@ def render_federal(lm_df: pd.DataFrame, clause_df: pd.DataFrame, fedrisk_df: pd.
         )
 
     with st.expander("FAR/DFARS Clauses Detected", expanded=True):
-        st.data_editor(clause_df, use_container_width=True, height=320, key="editor_clauses")
+        # Add a clickable reference column pointing to acquisition.gov search
+        if clause_df is not None and not clause_df.empty:
+            clause_view = clause_df.copy()
+            try:
+                clause_view["reference_url"] = clause_view.apply(lambda r: _acqgov_link(r.get("system"), r.get("clause")), axis=1)
+            except Exception:
+                clause_view["reference_url"] = None
+        else:
+            clause_view = clause_df
+        st.data_editor(
+            clause_view,
+            use_container_width=True,
+            height=320,
+            key="editor_clauses",
+            hide_index=True,
+            column_config={
+                "reference_url": st.column_config.LinkColumn(
+                    "Reference",
+                    help="Open the official text/search on acquisition.gov",
+                    display_text="acquisition.gov",
+                )
+            },
+        )
         st.download_button(
             "Download Clauses (CSV)",
             clause_df.to_csv(index=False).encode("utf-8"),
@@ -448,15 +633,32 @@ def render_federal(lm_df: pd.DataFrame, clause_df: pd.DataFrame, fedrisk_df: pd.
             key="dl_clauses",
         )
 
-    with st.expander("Federal Risk Flags (CMMC, ITAR/EAR, Data Rights, etc.)", expanded=True):
-        st.data_editor(fedrisk_df, use_container_width=True, height=320, key="editor_fedrisk")
-        st.download_button(
-            "Download Federal Risks (CSV)",
-            fedrisk_df.to_csv(index=False).encode("utf-8"),
-            file_name="federal_risks.csv",
-            mime="text/csv",
-            key="dl_fedrisk",
-        )
+    # Clause library & explainers (enriched view)
+    clause_exp_df = st.session_state.get("clause_exp_df")
+    if clause_exp_df is not None and not clause_exp_df.empty:
+        with st.expander("📚 Clause Library & Explainers (plain-English + actions)", expanded=True):
+            st.caption("Practical guidance only — not legal advice. Verify against the official clause text.")
+            st.data_editor(
+                clause_exp_df,
+                use_container_width=True,
+                height=360,
+                key="editor_clause_exp",
+                hide_index=True,
+                column_config={
+                    "reference_url": st.column_config.LinkColumn(
+                        "Reference",
+                        help="Open the official text/search on acquisition.gov",
+                        display_text="View on acquisition.gov",
+                    )
+                },
+            )
+            st.download_button(
+                "Download Clause Explainers (CSV)",
+                clause_exp_df.to_csv(index=False).encode("utf-8"),
+                file_name="clause_explainers.csv",
+                mime="text/csv",
+                key="dl_clause_explainers",
+            )
 
 # -----------------------------
 # UI
@@ -475,6 +677,9 @@ overlap = st.slider("Chunk overlap (chars)", 0, 1000, 400, 50)
 
 enable_fed = st.checkbox("Enable 🇺🇸 Federal smart checks (FAR/DFARS + Section L/M + CMMC/ITAR)", value=True)
 st.session_state["enable_fed"] = enable_fed
+
+use_llm_clause = st.checkbox("Use LLM to explain unknown clauses", value=False, help="If a clause isn't in the built-in library, generate a short explainer using the selected model.")
+st.session_state["use_llm_clause"] = use_llm_clause
 
 max_chunks = st.slider("Max chunks to analyze (for speed)", 5, 200, 40, 5)
 
@@ -560,11 +765,21 @@ if uploaded:
 if all(k in st.session_state for k in ("req_df","inst_df","risk_df")):
     st.success("Showing saved analysis results.")
     render_results(st.session_state["req_df"], st.session_state["inst_df"], st.session_state["risk_df"])
-    render_federal(st.session_state.get("lm_df", pd.DataFrame(columns=LM_COLS)),
-                   st.session_state.get("clause_df", pd.DataFrame(columns=CLAUSE_COLS)),
-                   st.session_state.get("fedrisk_df", pd.DataFrame(columns=FEDRISK_COLS)))
+    # Build clause explainers on the fly if missing (library; LLM only if enabled)
+    if "clause_df" in st.session_state and "clause_exp_df" not in st.session_state:
+        st.session_state["clause_exp_df"] = build_clause_explainers(
+            st.session_state.get("clause_df", pd.DataFrame(columns=CLAUSE_COLS)),
+            use_llm=st.session_state.get("use_llm_clause", False),
+            model=st.session_state.get("model", "gpt-4o-mini"),
+        )
+    render_federal(
+        st.session_state.get("lm_df", pd.DataFrame(columns=LM_COLS)),
+        st.session_state.get("clause_df", pd.DataFrame(columns=CLAUSE_COLS)),
+        st.session_state.get("fedrisk_df", pd.DataFrame(columns=FEDRISK_COLS)),
+    )
 
 if st.button("🔎 Analyze Documents", type="primary"):
+
     if not uploaded:
         st.warning("Please upload at least one PDF or DOCX file.")
         st.stop()
@@ -595,6 +810,12 @@ if st.button("🔎 Analyze Documents", type="primary"):
     st.session_state["lm_df"] = lm_df
     st.session_state["clause_df"] = clause_df
     st.session_state["fedrisk_df"] = fedrisk_df
+    # Build & store enriched clause explainers (library + optional LLM)
+    st.session_state["clause_exp_df"] = build_clause_explainers(
+        clause_df,
+        use_llm=st.session_state.get("use_llm_clause", False),
+        model=model,
+    )
 
     st.success("Analysis complete.")
     render_results(req_df, inst_df, risk_df)
