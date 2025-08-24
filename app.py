@@ -425,8 +425,11 @@ CLAUSE_LIBRARY: Dict[str, Dict[str, Any]] = {
     },
 }
 
-CLAUSE_EXPLAINER_TASK = (
-    "You will receive a JSON object with fields: system (e.g., 'FAR' or 'DFARS'), clause (e.g., '52.204-21'), and title if known.
+CLAUSE_EXPLAINER_TASK = """
+You will receive a JSON object with fields: system (e.g., 'FAR' or 'DFARS'), clause (e.g., '52.204-21'), and title if known.
+Explain the clause in plain English for proposal compliance. Return STRICT JSON with:
+{ 'summary': string, 'pitfalls': [string], 'actions': [string], 'artifacts': [string] } — concise and practical.
+""", clause (e.g., '52.204-21'), and title if known.
 "
     "Explain the clause in plain English for proposal compliance. Return STRICT JSON with: 
 "
@@ -687,7 +690,7 @@ max_chunks = st.slider("Max chunks to analyze (for speed)", 5, 200, 40, 5)
 current_key = _files_key(uploaded) if uploaded else ""
 prev_key = st.session_state.get("last_files_key", None)
 if uploaded and prev_key != current_key:
-    for _k in ("req_df","inst_df","risk_df","lm_df","clause_df","fedrisk_df"):
+    for _k in ("req_df","inst_df","risk_df","lm_df","clause_df","fedrisk_df","clause_exp_df"):
         st.session_state.pop(_k, None)
     st.session_state["last_files_key"] = current_key
 
